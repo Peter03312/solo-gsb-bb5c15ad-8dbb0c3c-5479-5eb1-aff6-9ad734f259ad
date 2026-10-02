@@ -632,6 +632,265 @@ def test_duplicate_effective_at_per_station_scope(client, station):
     assert client.post(f"/stations/{other}/threshold-versions", json=body).status_code == 201
 
 
+# ---------------------------------------------------------------- 阈值版本预演（不落库）
+
+def preview_version(client, station_id, minutes, rise, clear, reason="预演调整"):
+    return client.post(
+        f"/stations/{station_id}/threshold-versions/preview",
+        json={
+            "effective_at": iso(BASE + timedelta(minutes=minutes)),
+            "rise_threshold": rise,
+            "clear_threshold": clear,
+            "reason": reason,
+        },
+    )
+
+
+def app_state_db_path(client) -> str:
+    return client.app.state.settings.db_path
+
+
+def test_preview_unknown_station_404(client):
+    r = preview_version(client, 999, 0, 9.0, 7.0)
+    assert r.status_code == 404
+
+
+def test_preview_validation_matches_registration(client, station):
+    # 生效时间不带时区 → 400（沿用正式登记校验）
+    r = client.post(
+        f"/stations/{station}/threshold-versions/preview",
+        json={"effective_at": "2026-10-01T08:00:00", "rise_threshold": 9.0,
+              "clear_threshold": 7.0, "reason": "x"},
+    )
+    assert r.status_code == 400
+    # 上升阈值不大于解除阈值 → 400
+    assert preview_version(client, station, 0, 7.0, 9.0).status_code == 400
+    assert preview_version(client, station, 0, 7.0, 7.0).status_code == 400
+    # 原因必填（空串 → 400；与正式登记同一模型：纯空白非空字符串不在此列）
+    r = client.post(
+        f"/stations/{station}/threshold-versions/preview",
+        json={"effective_at": iso(BASE), "rise_threshold": 9.0,
+              "clear_threshold": 7.0, "reason": ""},
+    )
+    assert r.status_code == 400
+    # 非有限数值 → 400
+    for bad in ("NaN", "Infinity", "-Infinity"):
+        r = client.post(
+            f"/stations/{station}/threshold-versions/preview",
+            content=(
+                '{"effective_at":"%s","rise_threshold":%s,"clear_threshold":1.0,"reason":"x"}'
+                % (iso(BASE), bad)
+            ),
+            headers={"content-type": "application/json"},
+        )
+        assert r.status_code == 400
+
+
+def test_preview_does_not_persist(client, station, device):
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 9.5)  # 基准 10：不预警
+    r = preview_version(client, station, 0, 9.0, 7.0)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["dry_run"] is True
+    # 预演状态为预警
+    assert body["current"]["status"] == "normal"
+    assert body["preview"]["status"] == "warning"
+    # 候选版本以临时 id -1 标识
+    assert body["candidate"]["threshold_version_id"] == -1
+    ev = body["preview"]["events"][0]
+    assert ev["type"] == "warning"
+    assert ev["threshold_version_id"] == -1
+    assert ev["rise_threshold"] == 9.0
+    # 不落库：版本历史不可见
+    hist = client.get(f"/stations/{station}/threshold-versions").json()
+    assert hist["versions"] == []
+    # 不落库：待发布查询仍是现状
+    assert timeline(client, station)["status"] == "normal"
+    # 再次预演仍报 200（若误落库，同刻第二次应 409）
+    assert preview_version(client, station, 0, 9.0, 7.0).status_code == 200
+    # 阈值表行数确认为 0
+    import sqlite3
+    conn = sqlite3.connect(app_state_db_path(client))
+
+
+def test_preview_conflict_with_existing_same_instant(client, station):
+    r1 = make_version(client, station, 60, 9.0, 7.0, reason="已登记")
+    assert r1.status_code == 201
+    # 同一瞬间（换 +08:00 表示）预演 → 与正式登记同样 409
+    r2 = client.post(
+        f"/stations/{station}/threshold-versions/preview",
+        json={
+            "effective_at": iso((BASE + timedelta(minutes=60)).astimezone(timezone(timedelta(hours=8)))),
+            "rise_threshold": 9.5,
+            "clear_threshold": 7.5,
+            "reason": "同刻预演",
+        },
+    )
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["existing_version_id"] == r1.json()["version"]["id"]
+    # 不同时刻预演不冲突
+    assert preview_version(client, station, 120, 9.5, 7.5).status_code == 200
+
+
+def test_preview_station_result_matches_actual_registration(client, station, device):
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 9.5)  # 基准 10：正常
+    pv = preview_version(client, station, 0, 9.0, 7.0).json()
+    # 正式登记（无其他写入）
+    reg = make_version(client, station, 0, 9.0, 7.0).json()
+    actual = timeline(client, station)
+    # 状态、事件类型与时刻一致
+    assert actual["status"] == pv["preview"]["status"] == "warning"
+    assert [(e["type"], e["at"], e["reading_id"]) for e in actual["events"]] == \
+        [(e["type"], e["at"], e["reading_id"]) for e in pv["preview"]["events"]]
+    assert reg["pending_adjudication"]["status"] == "warning"
+    assert [(e["type"], e["at"]) for e in reg["pending_adjudication"]["events"]] == \
+        [(e["type"], e["at"]) for e in pv["preview"]["events"]]
+    # 正式登记后事件上的版本 id 换成真实版本 id，阈值本身不变
+    real_id = reg["version"]["id"]
+    assert actual["events"][0]["threshold_version_id"] == real_id
+    assert actual["events"][0]["rise_threshold"] == pv["preview"]["events"][0]["rise_threshold"]
+
+
+def test_preview_exact_effective_instant_uses_candidate(client, station, device):
+    make_version(client, station, 10, 11.0, 9.0)  # 既有版本 t=10 起上升 11
+    upload(client, device, 1, 0, 10.5)
+    upload(client, device, 2, 5, 10.5)
+    upload(client, device, 3, 10, 10.5)  # 现状：按 11 判定，序列被打断
+    assert timeline(client, station)["status"] == "normal"
+    # 预演同刻（t=10）候选会与既有版本冲突 → 409
+    assert preview_version(client, station, 10, 9.0, 7.0).status_code == 409
+    # 预演 t=5 生效：读数 2（t=5 同刻采用候选）、3 起按 9 判定
+    pv = preview_version(client, station, 5, 9.0, 7.0).json()
+    info = {r["reading_id"]: r for r in pv["preview"]["readings"]}
+    assert info[1]["threshold_version_id"] is None       # t=0 仍用基准
+    assert info[2]["threshold_version_id"] == -1         # t=5 同刻采用候选
+    assert info[3]["threshold_version_id"] == 1          # t=10 起候选被既有版本接替
+    # 预演版本序列：基准 → 候选(-1) → 既有版本(1)
+    assert [r["threshold_version_id"] for r in pv["preview"]["readings"]] == [None, -1, 1]
+    assert pv["preview"]["readings"][1]["rise_threshold"] == 9.0
+    assert pv["preview"]["readings"][2]["rise_threshold"] == 11.0
+
+
+def test_preview_zones_include_all_containing_station_only(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    s3, d3 = make_station_with_device(client, "丙站", "D3")
+    create_zone(client, [s1, s2], 0, 2)   # zone 1 包含 s1
+    create_zone(client, [s2, s3], 0, 2)   # zone 2 不包含 s1
+    pv = preview_version(client, s1, 0, 9.0, 7.0).json()
+    assert [z["zone_id"] for z in pv["zones"]] == [1]
+
+
+def test_preview_zone_recomputes_with_other_members_pending(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    # 甲站 9.5 不达基准 10；乙站已预警
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, d1, i, m, 9.5)
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, d2, i, m, 12.0)
+    pv = preview_version(client, s1, 0, 9.0, 7.0).json()
+    assert len(pv["zones"]) == 1
+    z = pv["zones"][0]
+    # 现状仅乙站预警（1 < K=2）→ 正常；预演两站齐预警 → 区域预警
+    assert z["current"]["status"] == "normal"
+    assert z["current"]["warning_station_ids"] == [s2]
+    assert z["preview"]["status"] == "warning"
+    assert z["preview"]["warning_station_ids"] == [s1, s2]
+    warn_ev = z["preview"]["events"][0]
+    assert warn_ev["type"] == "warning"
+    assert warn_ev["at"] == iso(BASE + timedelta(minutes=10)).replace("+00:00", "Z")
+    assert warn_ev["warning_station_ids"] == [s1, s2]
+    # 其他成员站（乙站）按现有待发布结果参与：其事件不变
+    assert [e["type"] for e in z["current"]["events"]] == []
+    # 预演不改变待发布区域查询
+    assert zone_timeline(client, 1)["status"] == "normal"
+
+
+def test_preview_zone_matches_actual_registration(client):
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, d1, i, m, 9.5)
+    for i, m in enumerate([0, 5, 10, 15, 21], start=1):
+        upload(client, d2, i, m, 12.0 if m <= 10 else 7.0)
+    # 乙站 t=10 预警、t=21 解除；甲站预演提严后 t=10 预警、随后不解除
+    pv = preview_version(client, s1, 0, 9.0, 7.0).json()
+    zprev = [(e["type"], e["at"], e["warning_station_ids"]) for e in pv["zones"][0]["preview"]["events"]]
+    make_version(client, s1, 0, 9.0, 7.0)
+    actual = zone_timeline(client, 1)
+    zactual = [(e["type"], e["at"], e["warning_station_ids"]) for e in actual["events"]]
+    assert actual["status"] == pv["zones"][0]["preview"]["status"]
+    assert zactual == zprev
+    # t=10 两站齐预警；t=21 乙站解除、甲站仍预警 → 计数 1 < K → 区域解除
+    assert zactual == [
+        ("warning", iso(BASE + timedelta(minutes=10)).replace("+00:00", "Z"), [s1, s2]),
+        ("cleared", iso(BASE + timedelta(minutes=21)).replace("+00:00", "Z"), [s1]),
+    ]
+
+
+def test_preview_zone_same_tick_merged(client):
+    # 两站在 t=10 同刻变化：预演使甲站同刻预警，乙站现状同刻预警 → 合并后一次性区域预警
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    create_zone(client, [s1, s2], 0, 2)
+    for d in (d1, d2):
+        for i, m in enumerate([0, 5, 10], start=1):
+            upload(client, d, i, m, 9.5)
+    pv = preview_version(client, s1, 0, 9.0, 7.0).json()
+    # 候选只作用于甲站：乙站仍不预警 → 区域不预警（联动严格按各站待发布结果）
+    assert pv["zones"][0]["preview"]["status"] == "normal"
+    # 乙站也登记同版阈值（正式）后，两站同刻预警；此时再对甲站做一次不影响结果的预演
+    make_version(client, s2, 0, 9.0, 7.0)
+    pv2 = preview_version(client, s1, 0, 9.0, 7.0).json()
+    events = pv2["zones"][0]["preview"]["events"]
+    assert [(e["type"], e["at"]) for e in events] == [
+        ("warning", iso(BASE + timedelta(minutes=10)).replace("+00:00", "Z"))
+    ]
+
+
+def test_preview_zone_initial_state_at_effective(client):
+    # 责任区 t=60 生效；两站在生效前已按基准 10 预警（水位 12）→ 现状区域生效即预警；
+    # 预演放宽甲站阈值（上升 100，t=0 起）使其预警消失 → 预演区域自始正常
+    s1, d1 = make_station_with_device(client, "甲站", "D1")
+    s2, d2 = make_station_with_device(client, "乙站", "D2")
+    for d in (d1, d2):
+        for i, m in enumerate([0, 5, 10], start=1):
+            upload(client, d, i, m, 12.0)
+    create_zone(client, [s1, s2], 60, 2)
+    assert zone_timeline(client, 1)["status"] == "warning"
+    assert [(e["type"], e["at"]) for e in zone_timeline(client, 1)["events"]] == [
+        ("warning", iso(BASE + timedelta(minutes=60)).replace("+00:00", "Z"))
+    ]
+    # 预演甲站放宽到 100：生效前甲站不预警 → 初始计数 1 < K，区域不预警
+    pv = preview_version(client, s1, 0, 100.0, 90.0).json()
+    z = pv["zones"][0]
+    assert z["current"]["status"] == "warning"
+    assert [(e["type"], e["at"]) for e in z["current"]["events"]] == [
+        ("warning", iso(BASE + timedelta(minutes=60)).replace("+00:00", "Z"))
+    ]
+    assert z["preview"]["status"] == "normal"
+    assert z["preview"]["events"] == []
+
+
+def test_preview_does_not_change_frozen_publication(client, station, device):
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 9.5)  # 基准 10：正常
+    r = client.post("/publish", json={"note": "冻结"})
+    pub_id = r.json()["publication_id"]
+    pv = preview_version(client, station, 0, 9.0, 7.0).json()
+    assert pv["preview"]["status"] == "warning"
+    # 已冻结公开结果不变
+    assert client.get(f"/publications/{pub_id}").json()["timelines"][0]["status"] == "normal"
+    assert client.get("/public/stations/{0}/timeline".format(station)).json()["status"] == "normal"
+    # 发布次数不增加（预演不落库任何内容）
+    assert [p["publication_id"] for p in client.get("/publications").json()] == [pub_id]
+
+
 # ---------------------------------------------------------------- 发布冻结
 
 def test_publish_freezes_timeline(client, station, device):

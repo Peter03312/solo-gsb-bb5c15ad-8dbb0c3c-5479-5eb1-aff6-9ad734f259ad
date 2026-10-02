@@ -1,6 +1,6 @@
 # 山洪水位预警裁定服务
 
-基于 **Python + FastAPI + SQLite** 的山洪水位预警裁定服务：监测站/设备登记、读数幂等补传、阈值版本管理（防汛方案调整）、按规则自动裁定预警与解除、审核修订并重算、**防汛责任区跨站联动预警**、发布冻结公开结果。
+基于 **Python + FastAPI + SQLite** 的山洪水位预警裁定服务：监测站/设备登记、读数幂等补传、阈值版本管理（防汛方案调整，**支持登记前不落库预演**）、按规则自动裁定预警与解除、审核修订并重算、**防汛责任区跨站联动预警**、发布冻结公开结果。
 
 ## 一键启动
 
@@ -76,6 +76,61 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 版本按 `effective_at <= 观测时间` 取最晚一版（边界包含，同刻用新版）；未命中时回退登记阈值；
 - 时间线响应新增每读数采用的阈值信息：`readings[].{reading_id, observed_at, water_level, rise_threshold, clear_threshold, threshold_version_id}`（`threshold_version_id` 为 `null` 表示基准值）；`events[]` 也附带触发当时的 `rise_threshold / clear_threshold / threshold_version_id`。原有顶层字段与其他接口的请求响应保持不变。
 
+## 阈值调整预演（登记前不落库演练）
+
+防汛人员在**正式登记阈值版本前**，可先预演该项调整对**待发布预警**的影响：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/stations/{id}/threshold-versions/preview` | 预演一版阈值调整的影响，**不落库、不改变待发布查询或已冻结发布** |
+
+- 请求体与正式登记**完全相同**：`{effective_at, rise_threshold, clear_threshold, reason}`，沿用同一套校验与冲突规则——必带时区、阈值有限且上升严格大于解除、原因必填（非法 → **400**）；未知站 → **404**；既有版本与候选**同一生效瞬间**（不同时区表示同一时刻也算）→ **409**；
+- 预演版本不写入数据库：版本历史不可见、待发布时间线/区域结果不变、历史发布快照不变；
+- 裁定语义与正式登记后完全一致：各读数按观测时间在“既有版本 + 候选版本”中取最近已生效版本，**生效同刻采用候选新值**；候选之后若还有既有版本，到其生效时刻仍由既有版本接替；候选版本在时间线中以临时 id **`-1`** 标识（正式登记后换成真实版本 id）；
+- 责任区联动：返回**该站及所有包含它的责任区**的 `current`（现状）与 `preview`（预演），区域**同一时刻合并所有站变化后再按 K 判定**；责任区内**其他成员站按现有待发布结果参与联动**（仅目标站套用候选版本）；
+- 整个结果取自**同一只读数据视图**（单连接、进程内锁，全程无写入）；在无其他写入时，随后正式登记得到的**状态、事件类型与时刻与预演一致**。
+
+响应结构（时间线字段与 `GET /stations/{id}/timeline`、`GET /zones/{id}/timeline` 相同）：
+
+```json
+{
+  "dry_run": true,
+  "station_id": 6,
+  "candidate": {
+    "effective_at": "2026-10-01T03:00:00Z",
+    "rise_threshold": 9.0,
+    "clear_threshold": 7.0,
+    "reason": "入汛提级预演",
+    "threshold_version_id": -1
+  },
+  "current": { "published": false, "status": "normal",  "events": [], "readings": [] },
+  "preview": { "published": false, "status": "warning", "events": [], "readings": [] },
+  "zones": [
+    {
+      "zone_id": 3,
+      "zone_name": "南岭片区",
+      "trigger_count": 2,
+      "current": {
+        "published": false, "status": "normal",
+        "warning_station_ids": [7], "warning_station_count": 1,
+        "events": [],
+        "members": [ {"station_id": 6, "warning": false}, {"station_id": 7, "warning": true} ]
+      },
+      "preview": {
+        "published": false, "status": "warning",
+        "warning_station_ids": [6, 7], "warning_station_count": 2,
+        "events": [ {"type": "warning", "at": "2026-10-01T03:10:00Z",
+                     "warning_station_ids": [6, 7], "warning_station_count": 2} ],
+        "members": []
+      }
+    }
+  ]
+}
+```
+
+> 预演不改变任何数据：反复调用安全；确认无误后再调
+> `POST /stations/{id}/threshold-versions` 正式登记。
+
 ## 防汛责任区（跨站联动预警）
 
 防汛人员按责任区查看多个监测站的**跨站联动**结果。登记责任区时提供：
@@ -142,6 +197,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/stations/{id}/devices` | 登记设备（设备号全局唯一，重复 409） |
 | GET | `/stations/{id}/devices` | 查询站内设备 |
 | POST | `/stations/{id}/threshold-versions` | 登记阈值版本（同站重复生效时间 409，非法阈值/无时区 400，未知站 404） |
+| POST | `/stations/{id}/threshold-versions/preview` | **预演**阈值调整对待发布预警的影响（不落库；校验/冲突规则同上，返回本站及所属责任区现状/预演） |
 | GET | `/stations/{id}/threshold-versions` | 查询阈值版本历史（含登记基准 baseline） |
 
 ### 读数补传（幂等）
@@ -183,7 +239,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## 调用示例
 
-完整端到端示例脚本（登记 → 补传 → 幂等重试 → 冲突 → 预警 → 发布 → 解除 → 更正 → 重发布 → 作废 → 阈值版本 → **责任区登记/同刻合并/初始状态/发布冻结/公开无结果**）：
+完整端到端示例脚本（登记 → 补传 → 幂等重试 → 冲突 → 预警 → 发布 → 解除 → 更正 → 重发布 → 作废 → 阈值版本 → **责任区登记/同刻合并/初始状态/发布冻结/公开无结果** → **阈值调整预演/不落库/同刻冲突/登记一致性**）：
 
 ```bash
 ./examples/demo.sh            # 默认打 http://127.0.0.1:8000
@@ -224,6 +280,11 @@ curl -X POST http://127.0.0.1:8000/stations/1/threshold-versions \
   -d '{"effective_at":"2026-10-02T08:00:00+08:00","rise_threshold":9.0,"clear_threshold":7.0,"reason":"入汛提级"}'
 curl http://127.0.0.1:8000/stations/1/threshold-versions
 
+# 登记前预演：同一入参，不落库返回本站及所属责任区的现状(current)/预演(preview)
+curl -X POST http://127.0.0.1:8000/stations/1/threshold-versions/preview \
+  -H 'content-type: application/json' \
+  -d '{"effective_at":"2026-10-02T08:00:00+08:00","rise_threshold":9.0,"clear_threshold":7.0,"reason":"入汛提级预演"}'
+
 # 登记防汛责任区（非空名称、带时区生效时间、不重复成员站、触发站数 K=2）
 curl -X POST http://127.0.0.1:8000/zones \
   -H 'content-type: application/json' \
@@ -243,6 +304,7 @@ curl http://127.0.0.1:8000/public/zones/1/timeline
 - `readings(device_id, seq)` **唯一约束**是幂等的最终防线：并发下同序号写只成功一次，其余按内容比对返回原结果或 409；
 - `threshold_versions(station_id, effective_at)` **唯一约束**保证同站生效时刻不重复（生效时间统一归一化为 UTC 存储，不同时区表示的同一时刻同样冲突）；
 - 责任区配置（`zones` / `zone_members`）只登记、不修改，区域联动结果在读取与发布时按成员站当前待发布时间线实时重算；发布在单事务内为全部监测站与责任区生成快照，公开结果读取的是冻结快照，与后续写入（含补传、审核修订、阈值调整）互不影响。
+- **阈值预演为纯只读操作**：在一次 `db.read()`（同一连接 + 进程内锁）内完成现状与预演的全部单站/责任区裁定，候选版本仅以内存中的虚拟行（临时 id `-1`）参与计算，不开启写事务、不产生任何数据库写入；因此预演期间拿到的现状/预演取自同一数据视图，且绝不会影响待发布查询与已冻结发布。
 
 ## 测试
 
@@ -251,7 +313,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
 
-覆盖：阈值/时间/水位/设备校验、幂等与冲突、预警与解除规则（含断段、乱序重排、跨段解除）、作废与更正重算、修订历史、**阈值版本（基准回退、同刻采用新版本、跨版本分别判定、调整不产生事件、快照冻结）**、**防汛责任区（登记校验、初始状态计入、同刻合并、K 达到/跌破、事件站 ID、补传/修订/阈值调整重算、发布冻结与公开无结果、replay_zone 纯函数边界）**、发布冻结、并发补传/发布不丢记录。
+覆盖：阈值/时间/水位/设备校验、幂等与冲突、预警与解除规则（含断段、乱序重排、跨段解除）、作废与更正重算、修订历史、**阈值版本（基准回退、同刻采用新版本、跨版本分别判定、调整不产生事件、快照冻结）**、**阈值版本预演（同一校验/同刻 409 冲突、不落库不改待发布与冻结结果、本站与所属责任区现状/预演、其他成员站按待发布联动、同刻合并、与正式登记状态/事件类型/时刻一致）**、**防汛责任区（登记校验、初始状态计入、同刻合并、K 达到/跌破、事件站 ID、补传/修订/阈值调整重算、发布冻结与公开无结果、replay_zone 纯函数边界）**、发布冻结、并发补传/发布不丢记录。
 
 ## 项目结构
 
@@ -264,7 +326,7 @@ app/
   main.py           # FastAPI 路由与应用工厂
 tests/
   conftest.py       # 导入期重定向默认数据库，避免污染工作区
-  test_api.py       # 端到端测试（74 例）
+  test_api.py       # 端到端测试（86 例）
 examples/demo.sh    # 调用示例脚本
 Dockerfile / docker-compose.yml
 ```

@@ -197,5 +197,80 @@ for z in d["zone_timelines"]:
           "事件:", [(e["type"], e["at"], e["warning_station_ids"]) for e in z["events"]])
 '
 echo "历史发布 1 的区域数: $(curl -s "$BASE/publications/1" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["zone_timelines"]))')"
+
+# ---------------------------------------------------------------
+# 阈值版本预演（登记前不落库演练）：在新站 6、7 与责任区 3 上完整演示
+# ---------------------------------------------------------------
+
+step "29. 预演准备：登记两个站（基准 10/8）与设备，并各补 3 条读数"
+curl -s -X POST "$BASE/stations" -H "$J" \
+  -d '{"name":"南坳站","rise_threshold":10.0,"clear_threshold":8.0}' > /dev/null
+curl -s -X POST "$BASE/stations" -H "$J" \
+  -d '{"name":"北岭站","rise_threshold":10.0,"clear_threshold":8.0}' > /dev/null
+curl -s -X POST "$BASE/stations/6/devices" -H "$J" -d '{"device_no":"DEV-006"}' > /dev/null
+curl -s -X POST "$BASE/stations/7/devices" -H "$J" -d '{"device_no":"DEV-007"}' > /dev/null
+# 南坳 9.5：基准 10 下不预警；北岭 12.0：基准 10 下预警
+for m in 00 05 10; do
+  curl -s -X POST "$BASE/readings" -H "$J" \
+    -d "{\"device_no\":\"DEV-006\",\"seq\":60$m,\"observed_at\":\"2026-10-01T11:$m:00+08:00\",\"water_level\":9.5}" > /dev/null
+  curl -s -X POST "$BASE/readings" -H "$J" \
+    -d "{\"device_no\":\"DEV-007\",\"seq\":70$m,\"observed_at\":\"2026-10-01T11:$m:00+08:00\",\"water_level\":12.0}" > /dev/null
+done
+curl -s -X POST "$BASE/zones" -H "$J" \
+  -d '{"name":"南岭片区","effective_at":"2026-10-01T11:00:00+08:00","station_ids":[6,7],"trigger_count":2}' > /dev/null
+echo "预演前：南坳状态 $(curl -s "$BASE/stations/6/timeline" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')，区域 3 状态 $(curl -s "$BASE/zones/3/timeline" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')（仅北岭预警，1 < K=2）"
+
+step "30. 预演：南坳站拟自 2026-10-01T11:00+08:00 起上升阈值降到 9（不落库，返回本站与区域 3 的现状/预演）"
+curl -s -X POST "$BASE/stations/6/threshold-versions/preview" -H "$J" \
+  -d '{"effective_at":"2026-10-01T11:00:00+08:00","rise_threshold":9.0,"clear_threshold":7.0,"reason":"入汛提级预演"}' \
+  | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print("dry_run:", d["dry_run"], "| 候选临时版本 id:", d["candidate"]["threshold_version_id"])
+print("南坳 现状:", d["current"]["status"], "→ 预演:", d["preview"]["status"],
+      "| 预演事件:", [(e["type"], e["at"], "版本", e["threshold_version_id"]) for e in d["preview"]["events"]])
+z = d["zones"][0]
+print("责任区", z["zone_id"], z["zone_name"], "现状:", z["current"]["status"],
+      z["current"]["warning_station_ids"], "→ 预演:", z["preview"]["status"],
+      z["preview"]["warning_station_ids"])
+print("区域预演事件:", [(e["type"], e["at"], e["warning_station_ids"]) for e in z["preview"]["events"]])
+'
+
+step "31. 预演不落库：版本历史无候选、待发布查询与已冻结发布均不变"
+echo "南坳版本数: $(curl -s "$BASE/stations/6/threshold-versions" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["versions"]))')（应为 0）"
+echo "待发布南坳仍为: $(curl -s "$BASE/stations/6/timeline" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')（normal）"
+echo "待发布区域 3 仍为: $(curl -s "$BASE/zones/3/timeline" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')（normal）"
+
+step "32. 预演沿用登记校验：未知站 404、无时区/非法阈值/空原因 400"
+curl -s -o /dev/null -w '未知站             → HTTP %{http_code}\n' \
+  -X POST "$BASE/stations/999/threshold-versions/preview" -H "$J" \
+  -d '{"effective_at":"2026-10-01T11:00:00+08:00","rise_threshold":9.0,"clear_threshold":7.0,"reason":"x"}'
+curl -s -o /dev/null -w '生效时间不带时区   → HTTP %{http_code}\n' \
+  -X POST "$BASE/stations/6/threshold-versions/preview" -H "$J" \
+  -d '{"effective_at":"2026-10-01T11:00:00","rise_threshold":9.0,"clear_threshold":7.0,"reason":"x"}'
+curl -s -o /dev/null -w '上升不大于解除     → HTTP %{http_code}\n' \
+  -X POST "$BASE/stations/6/threshold-versions/preview" -H "$J" \
+  -d '{"effective_at":"2026-10-01T11:00:00+08:00","rise_threshold":7.0,"clear_threshold":7.0,"reason":"x"}'
+
+step "33. 预演同刻冲突：先正式登记一版 12:00，再以同一瞬间（Z 表示）预演 → 409"
+curl -s -X POST "$BASE/stations/6/threshold-versions" -H "$J" \
+  -d '{"effective_at":"2026-10-01T12:00:00+08:00","rise_threshold":9.5,"clear_threshold":7.5,"reason":"正式登记"}' > /dev/null
+curl -s -w ' [HTTP %{http_code}]\n' -X POST "$BASE/stations/6/threshold-versions/preview" -H "$J" \
+  -d '{"effective_at":"2026-10-01T04:00:00Z","rise_threshold":9.2,"clear_threshold":7.2,"reason":"同刻预演"}'
+
+step "34. 正式登记预演的调整（11:00 起 9/7）：无其他写入时结果与预演一致"
+curl -s -X POST "$BASE/stations/6/threshold-versions" -H "$J" \
+  -d '{"effective_at":"2026-10-01T11:00:00+08:00","rise_threshold":9.0,"clear_threshold":7.0,"reason":"入汛提级"}' \
+  | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+p = d["pending_adjudication"]
+print("登记后南坳:", p["status"], "| 事件:", [(e["type"], e["at"], "版本", e["threshold_version_id"]) for e in p["events"]],
+      "（与步骤 30 的预演 status/类型/时刻一致，版本 id 换为真实 id）")
+'
+echo "登记后区域 3: $(curl -s "$BASE/zones/3/timeline" \
+  | python3 -c 'import sys,json;z=json.load(sys.stdin);print(z["status"], [(e["type"],e["at"]) for e in z["events"]])')"
+echo "（状态/事件类型/时刻与步骤 30 预演一致；预演的临时版本 id -1 已换为正式版本 id）"
+
 echo
 echo "演示完成。交互式文档：$BASE/docs"

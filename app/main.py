@@ -29,6 +29,10 @@ from .schemas import (
     ZoneCreate,
 )
 
+# 预演（不落库）时候选阈值版本在时间线中的临时 id：正式登记后会换成真实版本 id。
+# 取负值以与任何已登记版本（正整数 id）及基准值（null）区分。
+CANDIDATE_VERSION_ID = -1
+
 
 # ---------------------------------------------------------------- 工具函数
 
@@ -109,8 +113,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app = FastAPI(
         title="山洪水位预警裁定服务",
-        version="1.2.0",
-        description="监测站/设备登记、读数补传（幂等）、审核修订、阈值版本、单站预警裁定、防汛责任区跨站联动与发布冻结。",
+        version="1.3.0",
+        description="监测站/设备登记、读数补传（幂等）、审核修订、阈值版本（含不落库预演）、单站预警裁定、防汛责任区跨站联动与发布冻结。",
     )
     app.state.db = db
     app.state.settings = settings
@@ -161,11 +165,44 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         v = versions[idx]
         return v["rise_threshold"], v["clear_threshold"], v["id"]
 
-    def compute_timeline(conn: sqlite3.Connection, station_id: int) -> dict[str, Any]:
+    def candidate_version_row(
+        station_id: int, effective_at: datetime, rise: float, clear: float, reason: str
+    ) -> dict[str, Any]:
+        """构造一条**不落库**的候选阈值版本行（预演专用）。
+
+        字段形状对齐 threshold_versions 表行，可直接被 resolve_threshold 使用；
+        id 为负哨兵值，裁定时间线中据此标识“预演候选版本”。
+        """
+        return {
+            "id": CANDIDATE_VERSION_ID,
+            "station_id": station_id,
+            "effective_at": effective_at.isoformat(),
+            "rise_threshold": rise,
+            "clear_threshold": clear,
+            "reason": reason,
+            "created_at": None,
+        }
+
+    def compute_timeline(
+        conn: sqlite3.Connection,
+        station_id: int,
+        extra_versions: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        """裁定单站待发布时间线。
+
+        extra_versions 给出不落库的候选版本（仅预演使用）：与既有版本合并后，
+        各读数仍按“观测时间取最近已生效版本、同刻采用新版本”的同一规则命中阈值。
+        """
         st = conn.execute("SELECT * FROM stations WHERE id=?", (station_id,)).fetchone()
         if st is None:
             raise HTTPException(status_code=404, detail=f"监测站 {station_id} 不存在")
-        versions = load_threshold_versions(conn, station_id)
+        versions: list[Any] = list(load_threshold_versions(conn, station_id))
+        if extra_versions:
+            # 合并既有版本与候选版本后按生效时刻（再按 id）排序；
+            # 同刻时候选版本（id=-1）排在既有版本之前，但同刻冲突应由调用方预先拒绝，
+            # 正常预演路径下同刻二者不会同时出现。
+            versions = versions + [v for v in extra_versions if v["station_id"] == station_id]
+            versions.sort(key=lambda v: (parse_stored(v["effective_at"]), v["id"]))
         rows = conn.execute(
             """
             SELECT r.id, r.observed_at, r.water_level
@@ -276,10 +313,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "station_ids": [m["id"] for m in members],
         }
 
-    def compute_zone_timeline(conn: sqlite3.Connection, zone_id: int) -> dict[str, Any]:
+    def compute_zone_timeline(
+        conn: sqlite3.Connection,
+        zone_id: int,
+        threshold_overrides: Optional[dict[int, list[dict[str, Any]]]] = None,
+    ) -> dict[str, Any]:
         """重放责任区成员站待发布事件，得到区域联动状态与事件时间线。
 
         - 成员站待发布事件由各站当前全部有效读数实时裁定（补传 / 修订 / 阈值调整后即时反映）；
+        - threshold_overrides：{station_id: [不落库候选版本]}（仅预演使用）——
+          目标站按候选版本预演，其他成员站沿用现有待发布结果参与联动；
         - 生效时刻之前仍在预警的站计入初始状态，初始满足 K 即在生效时刻预警；
         - 同一时刻先合并所有站变化，再按 K 判定，每个时刻最多一个区域事件。
         """
@@ -290,12 +333,15 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         effective_at = parse_stored(zone["effective_at"])
         trigger_count = zone["trigger_count"]
 
+        overrides = threshold_overrides or {}
+
         changes: list[StationStateChange] = []
         initial_warning: list[int] = []
         member_status: list[dict[str, Any]] = []
         for m in members:
             station_id = m["id"]
-            tl = compute_timeline(conn, station_id)
+            # 同一请求内同一站只裁定一次（预演与正式路径共用同一时间线结果）
+            tl = compute_timeline(conn, station_id, overrides.get(station_id))
             last_before: Optional[str] = None
             for ev in tl["events"]:
                 ev_at = parse_stored(ev["at"])
@@ -639,6 +685,24 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     # ------------------------------------------------------------ 阈值版本（防汛方案调整）
 
+    def find_duplicate_threshold_version(
+        conn: sqlite3.Connection, station_id: int, eff_utc: datetime
+    ) -> Optional[sqlite3.Row]:
+        """同站同一生效瞬间（UTC 归一化比较，含不同时区表示）的既有版本。"""
+        return conn.execute(
+            "SELECT id FROM threshold_versions WHERE station_id=? AND effective_at=?",
+            (station_id, eff_utc.isoformat()),
+        ).fetchone()
+
+    def duplicate_version_error(station_id: int, eff_utc: datetime, version_id: int) -> HTTPException:
+        return HTTPException(
+            status_code=409,
+            detail={
+                "message": f"监测站 {station_id} 已存在生效时间 {iso_z(eff_utc)} 的阈值版本",
+                "existing_version_id": version_id,
+            },
+        )
+
     @app.post("/stations/{station_id}/threshold-versions", status_code=201, tags=["阈值版本"])
     def create_threshold_version(station_id: int, body: ThresholdVersionCreate) -> dict[str, Any]:
         """登记一版自生效时间起采用的阈值。
@@ -653,18 +717,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         now = iso_z(utc_now())
         with db.write_tx() as conn:
             get_station_or_404(conn, station_id)
-            dup = conn.execute(
-                "SELECT id FROM threshold_versions WHERE station_id=? AND effective_at=?",
-                (station_id, eff_str),
-            ).fetchone()
+            dup = find_duplicate_threshold_version(conn, station_id, eff_utc)
             if dup is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "message": f"监测站 {station_id} 已存在生效时间 {iso_z(eff_utc)} 的阈值版本",
-                        "existing_version_id": dup["id"],
-                    },
-                )
+                raise duplicate_version_error(station_id, eff_utc, dup["id"])
             try:
                 cur = conn.execute(
                     """
@@ -711,6 +766,91 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "clear_threshold": st["clear_threshold"],
             },
             "versions": [threshold_version_to_dict(r) for r in rows],
+        }
+
+    @app.post("/stations/{station_id}/threshold-versions/preview", tags=["阈值版本"])
+    def preview_threshold_version(station_id: int, body: ThresholdVersionCreate) -> dict[str, Any]:
+        """**不落库预演**一版阈值调整对待发布预警的影响（正式登记前演练）。
+
+        - 入参与正式登记完全一致，沿用同一套校验与冲突规则：
+          必带时区、阈值有限且上升严格大于解除、原因必填（非法 → 400）；
+          未知站 → 404；既有版本与候选**同一生效瞬间** → 409；
+        - 候选版本不写入数据库：不改变待发布查询、不改变已冻结发布、版本历史不可见；
+        - 返回目标站与**所有包含它的责任区**的现状（current）/ 预演（preview）状态与
+          完整事件时间线；责任区内其他成员站按现有待发布结果参与联动，
+          区域同刻变化合并后判定（与正式规则一致）；
+        - 整个结果取自同一只读数据视图；无其他写入时，随后正式登记得到的状态、
+          事件类型与时刻与本预演一致。
+        """
+        eff_utc = body.effective_at.astimezone(timezone.utc)
+        with db.read() as conn:
+            get_station_or_404(conn, station_id)
+            # 冲突规则与正式登记一致：同站同一生效瞬间即冲突（不区分时区表示）
+            dup = find_duplicate_threshold_version(conn, station_id, eff_utc)
+            if dup is not None:
+                raise duplicate_version_error(station_id, eff_utc, dup["id"])
+
+            candidate = candidate_version_row(
+                station_id, eff_utc, body.rise_threshold, body.clear_threshold, body.reason
+            )
+            overrides = {station_id: [candidate]}
+
+            # 现状与预演在同一连接（同一数据视图 + 进程内锁）内计算，全程无写入
+            current_station = compute_timeline(conn, station_id)
+            preview_station = compute_timeline(conn, station_id, [candidate])
+
+            zone_rows = conn.execute(
+                """
+                SELECT zone_id FROM zone_members WHERE station_id=?
+                ORDER BY zone_id
+                """,
+                (station_id,),
+            ).fetchall()
+            zones: list[dict[str, Any]] = []
+            for zr in zone_rows:
+                zone_id = zr["zone_id"]
+                current_zone = compute_zone_timeline(conn, zone_id)
+                preview_zone = compute_zone_timeline(conn, zone_id, overrides)
+                zones.append(
+                    {
+                        "zone_id": zone_id,
+                        "zone_name": current_zone["zone_name"],
+                        "trigger_count": current_zone["trigger_count"],
+                        "current": {
+                            "published": False,
+                            "status": current_zone["status"],
+                            "active_warning_since": current_zone["active_warning_since"],
+                            "warning_station_ids": current_zone["warning_station_ids"],
+                            "warning_station_count": current_zone["warning_station_count"],
+                            "events": current_zone["events"],
+                            "members": current_zone["members"],
+                        },
+                        "preview": {
+                            "published": False,
+                            "status": preview_zone["status"],
+                            "active_warning_since": preview_zone["active_warning_since"],
+                            "warning_station_ids": preview_zone["warning_station_ids"],
+                            "warning_station_count": preview_zone["warning_station_count"],
+                            "events": preview_zone["events"],
+                            # 其他成员站沿用现有待发布结果参与联动（仅目标站发生变化）
+                            "members": preview_zone["members"],
+                        },
+                    }
+                )
+
+        return {
+            "dry_run": True,
+            "station_id": station_id,
+            "candidate": {
+                "effective_at": iso_z(eff_utc),
+                "rise_threshold": body.rise_threshold,
+                "clear_threshold": body.clear_threshold,
+                "reason": body.reason,
+                "threshold_version_id": CANDIDATE_VERSION_ID,
+            },
+            "current": {"published": False, **current_station},
+            "preview": {"published": False, **preview_station},
+            "zones": zones,
         }
 
     # ------------------------------------------------------------ 裁定时间线（待发布）
