@@ -199,3 +199,48 @@ for z in d["zone_timelines"]:
 echo "历史发布 1 的区域数: $(curl -s "$BASE/publications/1" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["zone_timelines"]))')"
 echo
 echo "演示完成。交互式文档：$BASE/docs"
+
+step "29. 登记前预演阈值调整：候选自 08:55 起 上升 9 / 解除 7（只读、不落库）"
+# 现状：08:55 按基准 10 未达，序列自 09:00 起，09:15 才预警；
+# 预演：08:55 同刻即采用候选 9，连续 3 条于 09:05 满足首尾 10 分钟 → 预警提前到 09:05
+curl -s -X POST "$BASE/stations/2/threshold-versions/rehearse" -H "$J" \
+  -d '{"effective_at":"2026-10-01T08:55:00+08:00","rise_threshold":9.0,"clear_threshold":7.0,"reason":"入汛提级预演"}' \
+  | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print("persisted:", d["persisted"])
+s = d["station"]
+print("本站 现状:", s["current"]["status"], [(e["type"], e["at"]) for e in s["current"]["events"]])
+print("本站 预演:", s["candidate"]["status"], [(e["type"], e["at"]) for e in s["candidate"]["events"]])
+print("包含本站的责任区数:", len(d["zones"]), "（本站 2 不在任何责任区内）")
+'
+
+step "30. 预演沿用正式校验/冲突：同刻 409、非法阈值/无时区 400、未知站 404（且不落库）"
+curl -s -o /dev/null -w '与已登记版本同刻   → HTTP %{http_code}\n' \
+  -X POST "$BASE/stations/2/threshold-versions/rehearse" -H "$J" \
+  -d '{"effective_at":"2026-10-01T01:00:00Z","rise_threshold":8.0,"clear_threshold":6.0,"reason":"同刻预演"}'
+curl -s -o /dev/null -w '上升不大于解除     → HTTP %{http_code}\n' \
+  -X POST "$BASE/stations/2/threshold-versions/rehearse" -H "$J" \
+  -d '{"effective_at":"2026-10-01T12:00:00+08:00","rise_threshold":6.0,"clear_threshold":8.0,"reason":"非法"}'
+curl -s -o /dev/null -w '生效时间无时区     → HTTP %{http_code}\n' \
+  -X POST "$BASE/stations/2/threshold-versions/rehearse" -H "$J" \
+  -d '{"effective_at":"2026-10-01T12:00:00","rise_threshold":8.0,"clear_threshold":6.0,"reason":"无时区"}'
+curl -s -o /dev/null -w '未知监测站         → HTTP %{http_code}\n' \
+  -X POST "$BASE/stations/999/threshold-versions/rehearse" -H "$J" \
+  -d '{"effective_at":"2026-10-01T12:00:00+08:00","rise_threshold":8.0,"clear_threshold":6.0,"reason":"x"}'
+echo "版本历史仍为 1 条（预演不落库）: $(curl -s "$BASE/stations/2/threshold-versions" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["versions"]))')"
+echo "待发布查询不变: $(curl -s "$BASE/stations/2/timeline" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["status"], len(d["events"]), "个事件")')"
+
+step "31. 责任区联动预演：对成员站 3 预演一版阈值，区域 current/candidate 两套联动并列返回"
+curl -s -X POST "$BASE/stations/3/threshold-versions/rehearse" -H "$J" \
+  -d '{"effective_at":"2026-10-01T10:00:00+08:00","rise_threshold":8.0,"clear_threshold":6.0,"reason":"片区联动预演"}' \
+  | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+for z in d["zones"]:
+    cur, cand = z["current"], z["candidate"]
+    print("责任区", cur["zone_id"], cur["zone_name"], "K =", cur["trigger_count"])
+    print("  现状:", cur["status"], "预警站", cur["warning_station_ids"])
+    print("  预演:", cand["status"], "预警站", cand["warning_station_ids"],
+          [(e["type"], e["at"]) for e in cand["events"]])
+'

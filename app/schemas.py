@@ -81,6 +81,14 @@ class ThresholdVersionCreate(BaseModel):
         return self
 
 
+class ThresholdRehearsalRequest(ThresholdVersionCreate):
+    """阈值调整预演：字段与校验完全沿用正式登记（ThresholdVersionCreate）。
+
+    不落库，仅在内存中将该候选版本叠加到当前数据视图上重算待发布裁定，
+    以便防汛人员在登记前预判调整对本站及包含本站之责任区的影响。
+    """
+
+
 class ZoneCreate(BaseModel):
     """登记防汛责任区：非空名称、带时区生效时间、互不重复的成员站 ID、触发站数 K。"""
 
